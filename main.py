@@ -1,8 +1,13 @@
+#!/usr/bin/env python3
 import os
-import requests
+import sys
 import time
-import concurrent.futures
 import random
+import argparse
+import concurrent.futures
+import requests
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, urljoin
+from bs4 import BeautifulSoup  # Asegúrate de tener beautifulsoup4 instalado
 
 class Color:
     BLUE = '\033[94m'
@@ -30,36 +35,29 @@ class BSQLI:
         self.total_tests = 0
         self.verbose = False
         self.vulnerable_urls = []
-        self.timeout = 15  # Valor por defecto en segundos
+        self.timeout = 15  # Timeout para requests (valor máximo de espera)
+        self.vuln_threshold = None  # Umbral de respuesta para detectar vulnerabilidad
 
     def get_random_user_agent(self):
-        """
-        Retorna un user-agent aleatorio de la lista.
-        """
+        """Retorna un user-agent aleatorio."""
         return random.choice(self.USER_AGENTS)
 
     def perform_request(self, url, payload, cookie, method='GET', post_field='input'):
         """
         Realiza una petición HTTP (GET o POST) con el payload inyectado.
-        - Si la URL contiene [INJECT], se reemplaza por el payload.
-        - En GET se concatena, en POST se envía en el body (campo 'post_field').
-        
-        Retorna:
-            success (bool),
-            injected_url (str),
-            response_time (float),
-            status_code (int),
-            error_message (str)
+        Si la URL contiene el marcador [INJECT], se reemplaza; de lo contrario, se concatena en GET.
+        Retorna: success (bool), injected_url (str), response_time (float),
+                 status_code (int) y error_message (str)
         """
-        # Determinar punto de inyección
+        # Inyección: usar [INJECT] si se detecta en la URL
         if "[INJECT]" in url:
             injected_url = url.replace("[INJECT]", payload)
         else:
             if method.upper() == 'GET':
                 injected_url = url + payload
             else:
-                injected_url = url  # En POST, el payload irá en el cuerpo
-        
+                injected_url = url
+
         start_time = time.time()
         headers = {'User-Agent': self.get_random_user_agent()}
         try:
@@ -81,7 +79,6 @@ class BSQLI:
                 )
             else:
                 raise ValueError("Método HTTP no soportado.")
-            
             response.raise_for_status()
             response_time = time.time() - start_time
             return True, injected_url, response_time, response.status_code, None
@@ -90,9 +87,7 @@ class BSQLI:
             return False, injected_url, response_time, None, str(e)
 
     def read_file(self, path):
-        """
-        Lee un archivo y retorna una lista de líneas no vacías.
-        """
+        """Lee un archivo y retorna una lista de líneas no vacías."""
         try:
             with open(path, 'r', encoding='utf-8') as file:
                 return [line.strip() for line in file if line.strip()]
@@ -101,19 +96,12 @@ class BSQLI:
             return []
 
     def read_payloads_from_directory(self, dir_path):
-        """
-        Lee TODOS los archivos de texto en un directorio y
-        retorna una lista combinada de payloads.
-        """
+        """Lee todos los archivos de texto en un directorio y retorna una lista combinada de payloads."""
         all_payloads = []
         try:
-            # Iterar sobre todos los archivos del directorio
             for file_name in os.listdir(dir_path):
                 file_path = os.path.join(dir_path, file_name)
                 if os.path.isfile(file_path):
-                    # Puedes filtrar aquí por extensión si quieres
-                    # Por ejemplo, si solo quieres .txt: 
-                    # if file_name.lower().endswith('.txt'):
                     payloads = self.read_file(file_path)
                     all_payloads.extend(payloads)
             return all_payloads
@@ -122,9 +110,7 @@ class BSQLI:
             return []
 
     def save_vulnerable_urls(self, filename):
-        """
-        Guarda la lista de URLs vulnerables en un archivo.
-        """
+        """Guarda la lista de URLs vulnerables en un archivo."""
         try:
             with open(filename, 'w', encoding='utf-8') as file:
                 for url in self.vulnerable_urls:
@@ -133,7 +119,150 @@ class BSQLI:
         except Exception as e:
             print(f"{Color.RED}Error al guardar las URLs vulnerables: {e}{Color.RESET}")
 
-    def main(self):
+    def crawl_links(self, seed_url):
+        """
+        Realiza crawling en la URL semilla y extrae los links encontrados.
+        Se normalizan los enlaces relativos usando urljoin.
+        """
+        links = set()
+        try:
+            headers = {'User-Agent': self.get_random_user_agent()}
+            response = requests.get(seed_url, headers=headers, timeout=self.timeout)
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, 'html.parser')
+                for a in soup.find_all('a', href=True):
+                    full_link = urljoin(seed_url, a['href'])
+                    links.add(full_link)
+            return list(links)
+        except Exception as e:
+            print(f"{Color.RED}Error al hacer crawling en {seed_url}: {e}{Color.RESET}")
+            return []
+
+    def generate_targets_from_url(self, url):
+        """
+        Dada una URL, si tiene parámetros, genera versiones con [INJECT] en cada parámetro.
+        Si no tiene parámetros, se le concatena el marcador [INJECT].
+        """
+        parsed = urlparse(url)
+        if parsed.query:
+            query_dict = parse_qs(parsed.query)
+            targets = []
+            for param in query_dict:
+                new_query = query_dict.copy()
+                # Reemplazamos el valor del parámetro por el marcador [INJECT]
+                new_query[param] = "[INJECT]"
+                new_query_str = urlencode(new_query, doseq=True)
+                new_url = parsed._replace(query=new_query_str).geturl()
+                targets.append(new_url)
+            return targets
+        else:
+            return [url + "[INJECT]"]
+
+    def get_baseline(self, url, cookie, method, post_field):
+        """
+        Mide el tiempo de respuesta base de una URL (sin inyección) para usarlo en el ajuste del umbral.
+        """
+        headers = {'User-Agent': self.get_random_user_agent()}
+        try:
+            start = time.time()
+            if method.upper() == 'GET':
+                r = requests.get(url, headers=headers, cookies={'cookie': cookie} if cookie else None, timeout=self.timeout)
+            else:
+                r = requests.post(url, headers=headers, cookies={'cookie': cookie} if cookie else None,
+                                  data={post_field: 'baseline'}, timeout=self.timeout)
+            return time.time() - start
+        except Exception:
+            return self.timeout
+
+    def run(self, url, threads=0, method="GET", crawl=False, payloads_path="/home/hack4chxrry/BSQLiCherry/payloads",
+            cookie="", verbose=False, timeout=None):
+        """Modo no interactivo mediante línea de comandos."""
+        self.verbose = verbose
+        method = method.upper()
+        post_field = "input"  # Campo por defecto para POST
+
+        # Cargar payloads desde el directorio (o archivo) especificado
+        if os.path.isdir(payloads_path):
+            payloads = self.read_payloads_from_directory(payloads_path)
+        else:
+            payloads = self.read_file(payloads_path)
+
+        if not payloads:
+            print(f"{Color.RED}No se encontraron payloads válidos en: {payloads_path}{Color.RESET}")
+            return
+
+        # Generar objetivos: si se activa crawling, se recogen links adicionales
+        targets = set()
+        if crawl:
+            crawled = self.crawl_links(url)
+            for link in crawled:
+                targets.update(self.generate_targets_from_url(link))
+            targets.update(self.generate_targets_from_url(url))
+        else:
+            targets.update(self.generate_targets_from_url(url))
+        targets = list(targets)
+
+        if not targets:
+            print(f"{Color.RED}No se pudieron generar objetivos a partir de la URL proporcionada.{Color.RESET}")
+            return
+
+        # Ajuste automático del umbral de vulnerabilidad basado en la respuesta base,
+        # si no se proporcionó un timeout específico para el umbral.
+        if timeout is None:
+            baseline = self.get_baseline(targets[0].replace("[INJECT]", ""), cookie, method, post_field)
+            margin = 3  # margen de segundos a sumar
+            self.vuln_threshold = baseline + margin
+            print(f"{Color.YELLOW}Tiempo base: {baseline:.2f}s. Umbral de vulnerabilidad ajustado a: {self.vuln_threshold:.2f}s{Color.RESET}")
+        else:
+            self.vuln_threshold = timeout
+
+        print(f"{Color.CYAN}Iniciando escaneo en {len(targets)} objetivo(s) con {len(payloads)} payloads...{Color.RESET}")
+        # Realizar los tests (secuencial o concurrente)
+        if threads <= 0:
+            for target in targets:
+                for payload in payloads:
+                    self.total_tests += 1
+                    success, injected_url, response_time, status_code, error_message = self.perform_request(
+                        target, payload, cookie, method, post_field
+                    )
+                    if success and status_code and response_time >= self.vuln_threshold:
+                        self.vulnerabilities_found += 1
+                        self.vulnerable_urls.append(injected_url)
+                        if self.verbose:
+                            print(f"{Color.GREEN}✓ Vulnerable: {injected_url} - {response_time:.2f}s - Código: {status_code}{Color.RESET}")
+                        else:
+                            print(f"{Color.GREEN}✓ {injected_url}{Color.RESET}")
+                    elif self.verbose:
+                        print(f"{Color.RED}✗ No vulnerable: {injected_url} - {response_time:.2f}s - Código: {status_code} - Error: {error_message}{Color.RESET}")
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+                futures = []
+                for target in targets:
+                    for payload in payloads:
+                        futures.append(executor.submit(self.perform_request, target, payload, cookie, method, post_field))
+                for future in concurrent.futures.as_completed(futures):
+                    self.total_tests += 1
+                    success, injected_url, response_time, status_code, error_message = future.result()
+                    if success and status_code and response_time >= self.vuln_threshold:
+                        self.vulnerabilities_found += 1
+                        self.vulnerable_urls.append(injected_url)
+                        if self.verbose:
+                            print(f"{Color.GREEN}✓ Vulnerable: {injected_url} - {response_time:.2f}s - Código: {status_code}{Color.RESET}")
+                        else:
+                            print(f"{Color.GREEN}✓ {injected_url}{Color.RESET}")
+                    elif self.verbose:
+                        print(f"{Color.RED}✗ No vulnerable: {injected_url} - {response_time:.2f}s - Código: {status_code} - Error: {error_message}{Color.RESET}")
+
+        print(f"\n{Color.BLUE}Escaneo completo.{Color.RESET}")
+        print(f"{Color.YELLOW}Total de pruebas: {self.total_tests}{Color.RESET}")
+        print(f"{Color.GREEN}Vulnerabilidades encontradas: {self.vulnerabilities_found}{Color.RESET}")
+        if self.vulnerabilities_found > 0:
+            print(f"{Color.GREEN}✓ Se encontraron {self.vulnerabilities_found} vulnerabilidades.{Color.RESET}")
+        else:
+            print(f"{Color.RED}✗ No se encontraron vulnerabilidades.{Color.RESET}")
+
+    def interactive(self):
+        """Modo interactivo (tal como la versión original)."""
         print(Color.CYAN + r"""
     _____               __ __
     |   __ \.-----.-----.|  |__|
@@ -145,137 +274,70 @@ class BSQLI:
     YOUTUBE: Lostsec
         """ + Color.RESET)
 
-        # Configurar modo verbose
         verbose_input = input(Color.PURPLE + "¿Habilitar modo verbose? (s/n): " + Color.RESET).strip().lower()
-        if verbose_input in ['s', 'si', 'y', 'yes']:
-            self.verbose = True
+        self.verbose = verbose_input in ['s', 'si', 'y', 'yes']
 
-        # Selección de método HTTP (GET/POST)
-        method = input(Color.CYAN + "Ingrese el método HTTP a usar (GET/POST, por defecto GET): " + Color.RESET).strip().upper()
+        method = input(Color.CYAN + "Ingrese el método HTTP a usar (GET/POST, por defecto GET): " + Color.RESET).strip().upper() or "GET"
         if method not in ['GET', 'POST']:
-            method = 'GET'
+            method = "GET"
 
-        # Si es POST, preguntar por el campo a inyectar
-        post_field = 'input'
-        if method == 'POST':
+        post_field = "input"
+        if method == "POST":
             post_field_input = input(Color.CYAN + "Ingrese el nombre del campo para la inyección (por defecto 'input'): " + Color.RESET).strip()
             if post_field_input:
                 post_field = post_field_input
 
-        # Configurar timeout
         timeout_input = input(Color.CYAN + "Ingrese el tiempo de espera en segundos para las peticiones (por defecto 15): " + Color.RESET).strip()
         if timeout_input:
             try:
                 self.timeout = float(timeout_input)
             except ValueError:
-                print(f"{Color.YELLOW}Tiempo de espera inválido, usando 15 segundos por defecto.{Color.RESET}")
+                print(f"{Color.YELLOW}Tiempo inválido, usando 15 segundos por defecto.{Color.RESET}")
                 self.timeout = 15
 
-        # Obtener URL o archivo de URLs
-        input_url_or_file = input(Color.PURPLE + "Ingrese la URL o la ruta al archivo con la lista de URLs: " + Color.RESET).strip()
-        if not input_url_or_file:
-            print(f"{Color.RED}No se proporcionó ninguna URL o archivo.{Color.RESET}")
+        input_url = input(Color.PURPLE + "Ingrese la URL: " + Color.RESET).strip()
+        if not input_url:
+            print(f"{Color.RED}No se proporcionó URL.{Color.RESET}")
             return
 
-        # Si no es un archivo, asumimos que es una URL única
-        urls = [input_url_or_file] if not os.path.isfile(input_url_or_file) else self.read_file(input_url_or_file)
-        if not urls:
-            print(f"{Color.RED}No se proporcionaron URLs válidas.{Color.RESET}")
-            return
+        crawl_input = input(Color.CYAN + "¿Desea activar crawling? (s/n, por defecto n): " + Color.RESET).strip().lower()
+        crawl = crawl_input in ['s', 'si', 'y', 'yes']
 
-        # Pedir la ruta a los payloads
-        payload_path = input(Color.CYAN + "Ingrese la ruta completa al archivo o directorio de payloads: " + Color.RESET).strip()
-        if not payload_path:
-            print(f"{Color.RED}No se proporcionó ninguna ruta de payloads.{Color.RESET}")
-            return
-
-        # Determinar si es un directorio o un archivo
-        if os.path.isdir(payload_path):
-            # Leer todos los archivos dentro de ese directorio
-            payloads = self.read_payloads_from_directory(payload_path)
-        else:
-            # Asumir que es un solo archivo de payloads
-            payloads = self.read_file(payload_path)
-
-        if not payloads:
-            print(f"{Color.RED}No se encontraron payloads válidos en: {payload_path}{Color.RESET}")
-            return
-
-        # Obtener cookie si se desea
-        cookie = input(Color.CYAN + "Ingrese la cookie para incluir en la petición (deje en blanco si no hay): " + Color.RESET).strip()
-
-        # Configurar número de hilos
-        threads_input = input(Color.CYAN + "Ingrese el número de hilos concurrentes (0-10, deje vacío para 0): " + Color.RESET).strip()
+        payload_path = input(Color.CYAN + "Ingrese la ruta al directorio/archivo de payloads (por defecto /home/hack4chxrry/BSQLiCherry/payloads): " + Color.RESET).strip() or "/home/hack4chxrry/BSQLiCherry/payloads"
+        cookie = input(Color.CYAN + "Ingrese la cookie para la petición (deje en blanco si no hay): " + Color.RESET).strip()
+        threads_input = input(Color.CYAN + "Ingrese el número de hilos concurrentes (0-10, por defecto 0): " + Color.RESET).strip()
         try:
             threads = int(threads_input) if threads_input else 0
-            if threads < 0 or threads > 10:
-                raise ValueError("El número de hilos debe estar entre 0 y 10.")
-        except ValueError as e:
-            print(f"{Color.RED}Número de hilos inválido: {e}{Color.RESET}")
-            return
+        except ValueError:
+            print(f"{Color.RED}Número de hilos inválido, usando 0.{Color.RESET}")
+            threads = 0
 
-        print(f"\n{Color.PURPLE}Iniciando escaneo...{Color.RESET}")
-
-        try:
-            if threads == 0:
-                # Ejecución secuencial
-                for url in urls:
-                    for payload in payloads:
-                        self.total_tests += 1
-                        success, injected_url, response_time, status_code, error_message = self.perform_request(
-                            url, payload, cookie, method, post_field
-                        )
-                        # Criterio de "vulnerable" basado en tiempo >= timeout
-                        if success and status_code and response_time >= self.timeout:
-                            self.vulnerabilities_found += 1
-                            self.vulnerable_urls.append(injected_url)
-                            if self.verbose:
-                                print(f"{Color.GREEN}✓ SQLi Encontrado! URL: {injected_url} - Tiempo: {response_time:.2f}s - Código: {status_code}{Color.RESET}")
-                            else:
-                                print(f"{Color.GREEN}✓ URL Vulnerable: {injected_url}{Color.RESET}")
-                        else:
-                            if self.verbose:
-                                print(f"{Color.RED}✗ No vulnerable: {injected_url} - Tiempo: {response_time:.2f}s - Código: {status_code} - Error: {error_message}{Color.RESET}")
-            else:
-                # Ejecución concurrente
-                with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
-                    futures = []
-                    for url in urls:
-                        for payload in payloads:
-                            futures.append(
-                                executor.submit(self.perform_request, url, payload, cookie, method, post_field)
-                            )
-                    for future in concurrent.futures.as_completed(futures):
-                        self.total_tests += 1
-                        success, injected_url, response_time, status_code, error_message = future.result()
-                        if success and status_code and response_time >= self.timeout:
-                            self.vulnerabilities_found += 1
-                            self.vulnerable_urls.append(injected_url)
-                            if self.verbose:
-                                print(f"{Color.GREEN}✓ SQLi Encontrado! URL: {injected_url} - Tiempo: {response_time:.2f}s - Código: {status_code}{Color.RESET}")
-                            else:
-                                print(f"{Color.GREEN}✓ URL Vulnerable: {injected_url}{Color.RESET}")
-                        else:
-                            if self.verbose:
-                                print(f"{Color.RED}✗ No vulnerable: {injected_url} - Tiempo: {response_time:.2f}s - Código: {status_code} - Error: {error_message}{Color.RESET}")
-        except KeyboardInterrupt:
-            print(f"{Color.YELLOW}Escaneo interrumpido por el usuario.{Color.RESET}")
-
-        print(f"\n{Color.BLUE}Escaneo completo.{Color.RESET}")
-        print(f"{Color.YELLOW}Total de pruebas: {self.total_tests}{Color.RESET}")
-        print(f"{Color.GREEN}SQLi encontrados: {self.vulnerabilities_found}{Color.RESET}")
-        if self.vulnerabilities_found > 0:
-            print(f"{Color.GREEN}✓ Se encontraron {self.vulnerabilities_found} vulnerabilidades!{Color.RESET}")
-        else:
-            print(f"{Color.RED}✗ No se encontraron vulnerabilidades. ¡Mejor suerte la próxima vez!{Color.RESET}")
-
-        # Guardar URLs vulnerables
-        save_file = input(Color.PURPLE + "Ingrese el nombre del archivo para guardar las URLs vulnerables (deje vacío para omitir): " + Color.RESET).strip()
-        if save_file:
-            self.save_vulnerable_urls(save_file)
-
-        print(f"{Color.CYAN}¡Gracias por usar la herramienta BSQLi!{Color.RESET}")
+        self.run(url=input_url, threads=threads, method=method, crawl=crawl, payloads_path=payload_path, cookie=cookie, verbose=self.verbose)
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Herramienta BSQLi con crawling y param spider.")
+    parser.add_argument("-u", "--url", help="URL objetivo", required=False)
+    parser.add_argument("--threads", type=int, help="Número de hilos concurrentes", default=0)
+    parser.add_argument("--method", help="Método HTTP a usar (GET/POST)", default="GET")
+    parser.add_argument("--crawl", action="store_true", help="Activar crawling para obtener más URLs")
+    parser.add_argument("--payloads", help="Ruta al directorio o archivo de payloads",
+                        default="/home/hack4chxrry/BSQLiCherry/payloads")
+    parser.add_argument("--cookie", help="Cookie para las peticiones", default="")
+    parser.add_argument("--verbose", action="store_true", help="Activar modo verbose")
+    parser.add_argument("--timeout", type=float, help="Timeout (umbral) para detectar vulnerabilidad (opcional)", default=None)
+    args = parser.parse_args()
+
     scanner = BSQLI()
-    scanner.main()
+    if args.url:
+        # Modo línea de comandos (no interactivo)
+        scanner.run(url=args.url,
+                    threads=args.threads,
+                    method=args.method,
+                    crawl=args.crawl,
+                    payloads_path=args.payloads,
+                    cookie=args.cookie,
+                    verbose=args.verbose,
+                    timeout=args.timeout)
+    else:
+        # Modo interactivo si no se pasa URL por argumento
+        scanner.interactive()
