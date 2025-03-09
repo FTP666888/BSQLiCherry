@@ -30,7 +30,7 @@ class BSQLI:
         self.total_tests = 0
         self.verbose = False
         self.vulnerable_urls = []
-        self.timeout = 15  # Tiempo de espera por defecto en segundos
+        self.timeout = 15  # Valor por defecto en segundos
 
     def get_random_user_agent(self):
         """
@@ -41,17 +41,17 @@ class BSQLI:
     def perform_request(self, url, payload, cookie, method='GET', post_field='input'):
         """
         Realiza una petición HTTP (GET o POST) con el payload inyectado.
-        Si la URL contiene el marcador [INJECT], se reemplaza por el payload;
-        de lo contrario, en GET se concatena y en POST se envía en el cuerpo.
+        - Si la URL contiene [INJECT], se reemplaza por el payload.
+        - En GET se concatena, en POST se envía en el body (campo 'post_field').
         
-        Retorna una tupla:
-            - success (bool): True si la petición fue exitosa.
-            - injected_url (str): La URL (o endpoint) con el payload inyectado.
-            - response_time (float): Tiempo de respuesta.
-            - status_code (int): Código HTTP obtenido.
-            - error_message (str): Mensaje de error en caso de fallo.
+        Retorna:
+            success (bool),
+            injected_url (str),
+            response_time (float),
+            status_code (int),
+            error_message (str)
         """
-        # Determinar el punto de inyección
+        # Determinar punto de inyección
         if "[INJECT]" in url:
             injected_url = url.replace("[INJECT]", payload)
         else:
@@ -64,11 +64,21 @@ class BSQLI:
         headers = {'User-Agent': self.get_random_user_agent()}
         try:
             if method.upper() == 'GET':
-                response = requests.get(injected_url, headers=headers, cookies={'cookie': cookie} if cookie else None, timeout=self.timeout)
+                response = requests.get(
+                    injected_url,
+                    headers=headers,
+                    cookies={'cookie': cookie} if cookie else None,
+                    timeout=self.timeout
+                )
             elif method.upper() == 'POST':
-                # En POST, si no se usa marcador, se envía el payload en el campo especificado.
                 data = {post_field: payload}
-                response = requests.post(injected_url, headers=headers, cookies={'cookie': cookie} if cookie else None, data=data, timeout=self.timeout)
+                response = requests.post(
+                    injected_url,
+                    headers=headers,
+                    cookies={'cookie': cookie} if cookie else None,
+                    data=data,
+                    timeout=self.timeout
+                )
             else:
                 raise ValueError("Método HTTP no soportado.")
             
@@ -88,6 +98,27 @@ class BSQLI:
                 return [line.strip() for line in file if line.strip()]
         except Exception as e:
             print(f"{Color.RED}Error al leer el archivo {path}: {e}{Color.RESET}")
+            return []
+
+    def read_payloads_from_directory(self, dir_path):
+        """
+        Lee TODOS los archivos de texto en un directorio y
+        retorna una lista combinada de payloads.
+        """
+        all_payloads = []
+        try:
+            # Iterar sobre todos los archivos del directorio
+            for file_name in os.listdir(dir_path):
+                file_path = os.path.join(dir_path, file_name)
+                if os.path.isfile(file_path):
+                    # Puedes filtrar aquí por extensión si quieres
+                    # Por ejemplo, si solo quieres .txt: 
+                    # if file_name.lower().endswith('.txt'):
+                    payloads = self.read_file(file_path)
+                    all_payloads.extend(payloads)
+            return all_payloads
+        except Exception as e:
+            print(f"{Color.RED}Error al leer payloads del directorio {dir_path}: {e}{Color.RESET}")
             return []
 
     def save_vulnerable_urls(self, filename):
@@ -119,11 +150,12 @@ class BSQLI:
         if verbose_input in ['s', 'si', 'y', 'yes']:
             self.verbose = True
 
-        # Selección del método HTTP (GET o POST)
+        # Selección de método HTTP (GET/POST)
         method = input(Color.CYAN + "Ingrese el método HTTP a usar (GET/POST, por defecto GET): " + Color.RESET).strip().upper()
         if method not in ['GET', 'POST']:
             method = 'GET'
 
+        # Si es POST, preguntar por el campo a inyectar
         post_field = 'input'
         if method == 'POST':
             post_field_input = input(Color.CYAN + "Ingrese el nombre del campo para la inyección (por defecto 'input'): " + Color.RESET).strip()
@@ -136,7 +168,7 @@ class BSQLI:
             try:
                 self.timeout = float(timeout_input)
             except ValueError:
-                print(f"{Color.YELLOW}Tiempo de espera inválido, usando valor por defecto de 15 segundos.{Color.RESET}")
+                print(f"{Color.YELLOW}Tiempo de espera inválido, usando 15 segundos por defecto.{Color.RESET}")
                 self.timeout = 15
 
         # Obtener URL o archivo de URLs
@@ -145,22 +177,34 @@ class BSQLI:
             print(f"{Color.RED}No se proporcionó ninguna URL o archivo.{Color.RESET}")
             return
 
+        # Si no es un archivo, asumimos que es una URL única
         urls = [input_url_or_file] if not os.path.isfile(input_url_or_file) else self.read_file(input_url_or_file)
         if not urls:
             print(f"{Color.RED}No se proporcionaron URLs válidas.{Color.RESET}")
             return
 
-        # Obtener archivo de payloads
-        payload_path = input(Color.CYAN + "Ingrese la ruta completa al archivo de payloads (e.g., payloads/xor.txt): " + Color.RESET).strip()
-        payloads = self.read_file(payload_path)
+        # Pedir la ruta a los payloads
+        payload_path = input(Color.CYAN + "Ingrese la ruta completa al archivo o directorio de payloads: " + Color.RESET).strip()
+        if not payload_path:
+            print(f"{Color.RED}No se proporcionó ninguna ruta de payloads.{Color.RESET}")
+            return
+
+        # Determinar si es un directorio o un archivo
+        if os.path.isdir(payload_path):
+            # Leer todos los archivos dentro de ese directorio
+            payloads = self.read_payloads_from_directory(payload_path)
+        else:
+            # Asumir que es un solo archivo de payloads
+            payloads = self.read_file(payload_path)
+
         if not payloads:
-            print(f"{Color.RED}No se encontraron payloads válidos en el archivo: {payload_path}{Color.RESET}")
+            print(f"{Color.RED}No se encontraron payloads válidos en: {payload_path}{Color.RESET}")
             return
 
         # Obtener cookie si se desea
         cookie = input(Color.CYAN + "Ingrese la cookie para incluir en la petición (deje en blanco si no hay): " + Color.RESET).strip()
 
-        # Configurar número de hilos concurrentes
+        # Configurar número de hilos
         threads_input = input(Color.CYAN + "Ingrese el número de hilos concurrentes (0-10, deje vacío para 0): " + Color.RESET).strip()
         try:
             threads = int(threads_input) if threads_input else 0
@@ -179,25 +223,28 @@ class BSQLI:
                     for payload in payloads:
                         self.total_tests += 1
                         success, injected_url, response_time, status_code, error_message = self.perform_request(
-                            url, payload, cookie, method, post_field)
-                        # Se considera vulnerable si la respuesta supera el timeout (esto se puede ajustar según el criterio)
+                            url, payload, cookie, method, post_field
+                        )
+                        # Criterio de "vulnerable" basado en tiempo >= timeout
                         if success and status_code and response_time >= self.timeout:
                             self.vulnerabilities_found += 1
                             self.vulnerable_urls.append(injected_url)
                             if self.verbose:
-                                print(f"{Color.GREEN}✓ SQLi Encontrado! URL: {injected_url} - Tiempo de respuesta: {response_time:.2f} s - Código: {status_code}{Color.RESET}")
+                                print(f"{Color.GREEN}✓ SQLi Encontrado! URL: {injected_url} - Tiempo: {response_time:.2f}s - Código: {status_code}{Color.RESET}")
                             else:
                                 print(f"{Color.GREEN}✓ URL Vulnerable: {injected_url}{Color.RESET}")
                         else:
                             if self.verbose:
-                                print(f"{Color.RED}✗ No vulnerable: {injected_url} - Tiempo de respuesta: {response_time:.2f} s - Código: {status_code} - Error: {error_message}{Color.RESET}")
+                                print(f"{Color.RED}✗ No vulnerable: {injected_url} - Tiempo: {response_time:.2f}s - Código: {status_code} - Error: {error_message}{Color.RESET}")
             else:
                 # Ejecución concurrente
                 with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
                     futures = []
                     for url in urls:
                         for payload in payloads:
-                            futures.append(executor.submit(self.perform_request, url, payload, cookie, method, post_field))
+                            futures.append(
+                                executor.submit(self.perform_request, url, payload, cookie, method, post_field)
+                            )
                     for future in concurrent.futures.as_completed(futures):
                         self.total_tests += 1
                         success, injected_url, response_time, status_code, error_message = future.result()
@@ -205,12 +252,12 @@ class BSQLI:
                             self.vulnerabilities_found += 1
                             self.vulnerable_urls.append(injected_url)
                             if self.verbose:
-                                print(f"{Color.GREEN}✓ SQLi Encontrado! URL: {injected_url} - Tiempo de respuesta: {response_time:.2f} s - Código: {status_code}{Color.RESET}")
+                                print(f"{Color.GREEN}✓ SQLi Encontrado! URL: {injected_url} - Tiempo: {response_time:.2f}s - Código: {status_code}{Color.RESET}")
                             else:
                                 print(f"{Color.GREEN}✓ URL Vulnerable: {injected_url}{Color.RESET}")
                         else:
                             if self.verbose:
-                                print(f"{Color.RED}✗ No vulnerable: {injected_url} - Tiempo de respuesta: {response_time:.2f} s - Código: {status_code} - Error: {error_message}{Color.RESET}")
+                                print(f"{Color.RED}✗ No vulnerable: {injected_url} - Tiempo: {response_time:.2f}s - Código: {status_code} - Error: {error_message}{Color.RESET}")
         except KeyboardInterrupt:
             print(f"{Color.YELLOW}Escaneo interrumpido por el usuario.{Color.RESET}")
 
@@ -222,7 +269,7 @@ class BSQLI:
         else:
             print(f"{Color.RED}✗ No se encontraron vulnerabilidades. ¡Mejor suerte la próxima vez!{Color.RESET}")
 
-        # Guardar URLs vulnerables en un archivo (opcional)
+        # Guardar URLs vulnerables
         save_file = input(Color.PURPLE + "Ingrese el nombre del archivo para guardar las URLs vulnerables (deje vacío para omitir): " + Color.RESET).strip()
         if save_file:
             self.save_vulnerable_urls(save_file)
